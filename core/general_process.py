@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 
-from utils.pb_api import PbTalker
-from utils.general_utils import get_logger, extract_and_convert_dates, is_chinese
-from agents.get_info import *
 import json
-from scrapers import *
-from utils.zhipu_search import run_v4_async
-from urllib.parse import urlparse
-from crawl4ai import AsyncWebCrawler, CacheMode
 from datetime import datetime
-import feedparser
+from urllib.parse import urlparse
 
+import feedparser
+from agents.get_info import *
+from crawl4ai import AsyncWebCrawler, CacheMode
+from scrapers import *
+from utils.general_utils import (extract_and_convert_dates, get_logger,
+                                 is_chinese)
+from utils.pb_api import PbTalker
+from utils.zhipu_search import run_v4_async
 
 project_dir = os.environ.get("PROJECT_DIR", "")
 if project_dir:
@@ -84,6 +85,8 @@ async def main_process(focus: dict, sites: list):
     get_info_prompts = [get_info_sys_prompt, get_info_suffix_prompt, model]
 
     working_list = set()
+    parent_urls = set()  # 存储初始URL（父URL）
+    
     if focus.get('search_engine', False):
         query = focus_point if not explanation else f"{focus_point}({explanation})"
         search_intent, search_content = await run_v4_async(query, _logger=wiseflow_logger)
@@ -120,6 +123,7 @@ async def main_process(focus: dict, sites: list):
             await info_process(url, title, author, publish_date, texts, {}, focus_id, get_info_prompts)
 
     recognized_img_cache = {}
+    allowed_domains = set()
     for site in sites:
         if site.get('type', 'web') == 'rss':
             try:
@@ -130,14 +134,29 @@ async def main_process(focus: dict, sites: list):
             rss_urls = {entry.link for entry in feed.entries if entry.link}
             wiseflow_logger.debug(f'get {len(rss_urls)} urls from rss source {site["url"]}')
             working_list.update(rss_urls - existing_urls)
+            parent_urls.update(rss_urls - existing_urls)  # RSS URL作为父URL
+            # 添加RSS源中链接的域名到allowed_domains
+            for rss_url in rss_urls:
+                domain = urlparse(rss_url).netloc
+                allowed_domains.add(domain)
         else:
+            domain = urlparse(site['url']).netloc
+            allowed_domains.add(domain)
             working_list.add(site['url'])
+            parent_urls.add(site['url'])  # 站点URL作为父URL
     
     await crawler.start()
     while working_list:
         url = working_list.pop()
         existing_urls.add(url)
-        wiseflow_logger.debug(f'process new url, still {len(working_list)} urls in working list')
+        is_parent = url in parent_urls
+        wiseflow_logger.debug(f'process {"parent" if is_parent else "child"} url: {url}, still {len(working_list)} urls in working list')
+            
+        current_domain = urlparse(url).netloc
+        if current_domain not in allowed_domains:  # 简化了判断条件
+            wiseflow_logger.debug(f'skip {url} because domain {current_domain} not in allowed domains')
+            continue
+            
         has_common_ext = any(url.lower().endswith(ext) for ext in common_file_exts)
         if has_common_ext:
             wiseflow_logger.debug(f'{url} is a common file, skip')
@@ -196,15 +215,25 @@ async def main_process(focus: dict, sites: list):
 
         link_dict, links_parts, contents, recognized_img_cache = await pre_process(raw_markdown, base_url, used_img, recognized_img_cache, existing_urls)
 
-        if link_dict and links_parts:
+        if link_dict and links_parts and is_parent:
             links_texts = []
             for _parts in links_parts:
                 links_texts.extend(_parts.split('\n\n'))
             more_url = await get_more_related_urls(links_texts, link_dict, get_link_prompts, _logger=wiseflow_logger)
             if more_url:
-                wiseflow_logger.debug(f'get {len(more_url)} more related urls, will add to working list')
-                working_list.update(more_url - existing_urls)
-            
+                # 先过滤域名
+                filtered_urls = set()
+                for new_url in more_url:
+                    new_domain = urlparse(new_url).netloc
+                    if new_domain in allowed_domains:
+                        filtered_urls.add(new_url)
+                    else:
+                        wiseflow_logger.debug(f'skip {new_url} because domain {new_domain} not in allowed domains')
+                
+                # 再过滤已存在的URL
+                wiseflow_logger.debug(f'get {len(filtered_urls)} more related urls after domain filtering, will add to working list')
+                working_list.update(filtered_urls - existing_urls)
+
         if not contents:
             continue
 
